@@ -61,6 +61,42 @@ class ReleaseResponse(BaseModel):
     pool_id: int
 
 
+class PoolRenumberRequest(BaseModel):
+    new_cidr: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "New pool network, e.g. 10.20.0.0/16. Must be a strict IPv4 CIDR "
+            "with the same prefix length as the current pool"
+        ),
+    )
+
+
+class RenumberedExclusion(BaseModel):
+    old_cidr: str
+    new_cidr: str
+
+
+class RenumberedAllocation(BaseModel):
+    allocation_id: int = Field(..., description="Row id, preserved by the move")
+    request_id: str
+    old_cidr: str
+    new_cidr: str
+    prefix_length: int
+
+
+class PoolRenumberResponse(BaseModel):
+    pool_id: int
+    old_cidr: str
+    new_cidr: str
+    exclusions: list[RenumberedExclusion] = Field(
+        ..., description="Old -> new CIDR mapping for every exclusion, sorted by new address"
+    )
+    allocations: list[RenumberedAllocation] = Field(
+        ..., description="Old -> new CIDR mapping for every allocation, sorted by new address"
+    )
+
+
 class AllocationItem(BaseModel):
     cidr: str
     request_id: str

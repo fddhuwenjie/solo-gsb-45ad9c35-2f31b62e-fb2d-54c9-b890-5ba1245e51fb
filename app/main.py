@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import bgpplan, migration, partition, reserve, service, snapshot
+from . import bgpplan, migration, partition, renumber, reserve, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
@@ -32,6 +32,8 @@ from .schemas import (
     PartitionRequest,
     PartitionResponse,
     PoolCreateRequest,
+    PoolRenumberRequest,
+    PoolRenumberResponse,
     PoolResponse,
     PoolStatusResponse,
     ReleaseResponse,
@@ -51,12 +53,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "reserve policy-gated batches of subnets atomically, "
         "partition pools into exactly covering sub-pools, "
         "migrate in-use allocations between pools while preserving their identity, "
+        "renumber a whole pool by translating its exclusions and allocations by "
+        "the same offset, "
         "build RFC 2317 reverse-DNS delegation plans for current allocations, "
         "statelessly audit BGP announcements against AS relationships, "
         "and record confirmable BGP announcement plans pinned to pool state."
@@ -147,6 +151,15 @@ def get_pool(pool_id: int) -> PoolStatusResponse:
 )
 def add_exclusion(pool_id: int, body: ExclusionCreateRequest) -> ExclusionResponse:
     return ExclusionResponse(**service.add_exclusion(pool_id, body.cidr))
+
+
+@app.post(
+    "/pools/{pool_id}/renumber",
+    response_model=PoolRenumberResponse,
+    tags=["pools"],
+)
+def renumber_pool(pool_id: int, body: PoolRenumberRequest) -> PoolRenumberResponse:
+    return PoolRenumberResponse(**renumber.renumber_pool(pool_id, body.new_cidr))
 
 
 @app.post(
