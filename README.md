@@ -3,6 +3,7 @@
 基于 **Python + FastAPI + SQLite** 的 IPv4 地址池与子网分配服务。
 
 - 地址池可声明**排除网段**（永不参与分配）
+- 可对地址池**整体改址**：提交同前缀长度的新 CIDR，排除网段与已分配子网按相对池起点的地址偏移整体平移，保留前缀长度、记录 ID、`request_id` 与创建时间（单写事务，旧/新 CIDR 对照返回）
 - 按 `prefix_length` 申请子网，从剩余空间中选取**起始地址最小的对齐网段**
 - 分配之间、分配与排除网段之间**保证不重叠**
 - `request_id` 幂等重试：相同请求返回原结果；参数变化返回 **409 冲突**
@@ -61,6 +62,7 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `GET` | `/pools` | 列出所有地址池 |
 | `GET` | `/pools/{id}` | 池状态：排除、当前分配、合并后的空闲 CIDR |
 | `POST` | `/pools/{id}/exclusions` | 追加排除网段 |
+| `POST` | `/pools/{id}/renumber` | 整体改址：同前缀长度新 CIDR，排除/分配按偏移平移（单写事务） |
 | `POST` | `/pools/{id}/allocations` | 按前缀长度申请子网（需带 `request_id`） |
 | `POST` | `/pools/{id}/reservations` | 按策略批量预留子网：单写事务、整批回滚（`batch_id` 幂等） |
 | `DELETE` | `/pools/{id}/allocations/{request_id}` | 释放子网 |
@@ -824,6 +826,83 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 - 并发提交不同批次由写事务串行化，不会选中同一块空间；并发使用同一 `batch_id`
   时恰好记录一批，其余请求重放原结果。
 
+### 16. 地址池整体改址（同前缀长度平移）
+
+`POST /pools/{id}/renumber` 把地址池**整体搬迁**到一个新的 CIDR。调用方只提交：
+
+- `new_cidr`：新池网段，必须是严格合法的 IPv4 CIDR，且**前缀长度与当前池完全相同**
+  （例如把 `10.10.0.0/22` 改到 `172.20.0.0/22`，不能改成 `/20` 或 `/24`）。
+
+池本身保留同一**池 id 与创建时间**；每条排除网段与每个已分配子网都按
+**各自相对池起点的地址偏移**整体平移——即新地址 = 旧地址 +（新池起点 − 旧池起点），
+**前缀长度、数据库行 ID、`request_id`、`created_at` 全部原样保留**，不会重新选址、
+也不会产生新行。响应给出池本身、全部排除网段与全部分配的**旧 → 新 CIDR 对照**
+（排除与分配均按旧地址数值排序）：
+
+```bash
+curl -X POST http://localhost:8000/pools/1/renumber \
+  -H 'Content-Type: application/json' \
+  -d '{"new_cidr": "172.20.0.0/22"}'
+```
+
+```json
+{
+  "pool_id": 1,
+  "old_cidr": "10.10.0.0/22",
+  "new_cidr": "172.20.0.0/22",
+  "exclusions": [
+    {"old_cidr": "10.10.2.0/24", "new_cidr": "172.20.2.0/24"}
+  ],
+  "allocations": [
+    {"request_id": "order-42", "old_cidr": "10.10.0.0/24",
+     "new_cidr": "172.20.0.0/24", "prefix_length": 24,
+     "allocation_id": 1, "created_at": "2026-10-04T09:00:00+00:00"}
+  ]
+}
+```
+
+改址成功后，所有既有接口立刻面向**新地址**工作：
+
+```bash
+# 池状态查询返回新 CIDR 与平移后的排除/分配、空闲网段
+curl http://localhost:8000/pools/1
+
+# 相同 request_id 幂等重试返回同一条记录（id 不变），CIDR 为新地址
+curl -X POST http://localhost:8000/pools/1/allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id": "order-42", "prefix_length": 24}'
+
+# 释放也使用新地址（响应里的 released 是新 CIDR）
+curl -X DELETE http://localhost:8000/pools/1/allocations/order-42
+```
+
+因为所有网段由同一个常量偏移平移，池内的相对拓扑（空闲形状、分配对齐、排除空洞）
+**逐位保持不变**；跨八位组边界改址也安全（平移保持前缀对齐）。新旧 CIDR 相同的
+改址请求是合法的空操作，返回旧=新的对照。
+
+**全部检查与改写在同一个 `BEGIN IMMEDIATE` 写事务内完成**，依次校验：
+
+1. `new_cidr` 严格合法（`422 invalid_cidr`，含主机位或 IPv6 均拒绝），且前缀长度
+   与现池一致（`422 renumber_prefix_length_changed`）；
+2. 新池网段**不得与任何其他现有地址池重叠**
+   （`409 renumber_pool_conflict`；注意地址池平时允许重叠，这是改址特有的约束）；
+3. 平移后的每条排除网段与每个已分配子网必须**仍完全落在新池内**
+   （`422 renumber_exclusion_outside_pool` /
+   `422 renumber_allocation_outside_pool`），且平移后的全部网段**互不冲突**
+   （`409 renumber_translated_range_conflict`）；
+4. 池存在 `planned` 或 `active` 的 **BGP 公告计划**时拒绝
+   （`409 renumber_blocked_by_bgp_plan`）——计划固定了旧池状态摘要，改址会使计划失效；
+5. 池出现在**已完成的批量预留**（`reservation_batches`）幂等记录中时拒绝
+   （`409 renumber_blocked_by_reservation_batch`），出现在**跨池迁移**
+   （`allocation_migrations`，源池或目标池任一身份）幂等记录中时拒绝
+   （`409 renumber_blocked_by_allocation_migration`）——这些历史操作必须能按
+   `batch_id` / `operation_id` 回放并返回**当时的旧地址**，改址会让历史回放失真。
+
+全部通过后才在同一事务内就地更新池 CIDR 与各记录 CIDR（池行不删除重建，外键关系
+不变）；任一步失败**整体回滚，原池与全部记录保持不变**，包括清单中本会先平移的
+记录。池不存在返回 `404 pool_not_found`。注意：普通单笔分配（`/allocations`）不是
+历史回放记录，随池一起平移，不构成阻碍。
+
 ## 错误响应
 
 统一格式：
@@ -886,6 +965,14 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 | 409 | `bgp_plan_state_conflict` | 计划创建/激活时池状态已变：摘要不一致或覆盖关系不再成立 |
 | 409 | `batch_id_conflict` | 同一 `batch_id` 以不同参数（池、规则或预留项）重放 |
 | 409 | `reservation_denied` | 批内某项选中的最小空闲网段未完全落在 allow 段内（整批回滚） |
+| 409 | `renumber_pool_conflict` | 改址后的新池网段与其他现有地址池重叠 |
+| 409 | `renumber_translated_range_conflict` | 平移后的排除/分配网段之间互相冲突 |
+| 409 | `renumber_blocked_by_bgp_plan` | 池存在 planned/active BGP 公告计划 |
+| 409 | `renumber_blocked_by_reservation_batch` | 池出现在已完成的批量预留幂等记录中 |
+| 409 | `renumber_blocked_by_allocation_migration` | 池作为源/目标出现在已完成的跨池迁移幂等记录中 |
+| 409 | `renumber_conflict` | 改址写入时撞上数据库唯一约束 |
+| 422 | `renumber_prefix_length_changed` | 新 CIDR 前缀长度与现池不一致 |
+| 422 | `renumber_exclusion_outside_pool` / `renumber_allocation_outside_pool` | 平移后的排除网段 / 已分配子网未完全落在新池内 |
 | 422 | `bgp_announcement_outside_pool` | 公告前缀不完全位于地址池内 |
 | 422 | `bgp_announcement_overlaps_exclusion` | 公告前缀与池的排除网段重叠 |
 | 422 | `bgp_allocation_uncovered` | 存在当前分配未被任何审计通过的公告覆盖 |
@@ -925,6 +1012,11 @@ curl -X POST http://localhost:8000/pools/1/reservations \
   不会选中同一块空闲空间；任一项失败（命中 deny、空间不足、`request_id` 冲突）
   整体回滚，**不会留下部分预留**；`reservation_batches.batch_id` 主键保证同一批次键
   并发/重放只真正执行一次。
+- 地址池**整体改址**的全部检查与改写（前缀长度、与其他池重叠、平移后网段落在新池内
+  且互不冲突、BGP 计划/批量预留/跨池迁移历史记录阻碍判定，以及池与全部记录 CIDR 的
+  就地更新）都在单个 `BEGIN IMMEDIATE` 写事务内完成：并发改址/分配被串行化，任一
+  检查失败整体回滚，**原池与全部记录保持不变**。池行就地更新而非删除重建，池 id 与
+  外键关系不变；行 ID、`request_id`、前缀长度与 `created_at` 在平移中原样保留。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构
@@ -933,6 +1025,7 @@ curl -X POST http://localhost:8000/pools/1/reservations \
 ├── app/
 │   ├── main.py        # FastAPI 路由与异常处理
 │   ├── service.py     # 业务逻辑：创建/分配/释放/状态/反向委派计划
+│   ├── renumber.py    # 地址池整体改址：单写事务按偏移平移排除/分配，保留行身份
 │   ├── snapshot.py    # 池快照导出/恢复：规范 JSON、SHA-256 摘要、幂等替换
 │   ├── partition.py   # 池分区迁移：单写事务校验+替换源池，operation_id 幂等
 │   ├── migration.py   # 已分配子网跨池迁移：单写事务固定两池、保留行身份，operation_id 幂等

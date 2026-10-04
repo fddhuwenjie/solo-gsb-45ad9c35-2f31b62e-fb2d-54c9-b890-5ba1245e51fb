@@ -416,6 +416,48 @@ class AllocationMigrationResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Whole-pool renumbering
+# ---------------------------------------------------------------------------
+
+
+class RenumberRequest(BaseModel):
+    new_cidr: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "New pool CIDR; must have the same prefix length as the current "
+            "pool CIDR, e.g. renumber 10.0.0.0/22 to 10.20.0.0/22"
+        ),
+    )
+
+
+class RenumberExclusionResponse(BaseModel):
+    old_cidr: str
+    new_cidr: str
+
+
+class RenumberAllocationResponse(BaseModel):
+    request_id: str
+    old_cidr: str
+    new_cidr: str
+    prefix_length: int
+    allocation_id: int = Field(..., description="Row id, preserved by the renumber")
+    created_at: str
+
+
+class RenumberResponse(BaseModel):
+    pool_id: int
+    old_cidr: str
+    new_cidr: str
+    exclusions: list[RenumberExclusionResponse] = Field(
+        ..., description="Old -> new CIDR map for exclusions, ordered by old address"
+    )
+    allocations: list[RenumberAllocationResponse] = Field(
+        ..., description="Old -> new CIDR map for allocations, ordered by old address"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stateless BGP announcement auditing
 # ---------------------------------------------------------------------------
 
